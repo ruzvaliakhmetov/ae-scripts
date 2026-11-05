@@ -7,7 +7,7 @@
  * Choose your scripts folder on first use.
  * Optional: put ScriptShelf.json at the root of that folder to define cards.
  * Without JSON, the launcher displays the original filename buttons.
- * Long lists scroll with the scrollbar on the right.
+ * Long lists scroll by dragging the scrollbar thumb or the list itself.
  */
 
 (function scriptShelf(thisObj) {
@@ -22,10 +22,19 @@
     var PANEL_MARGIN = 10;
     var PANEL_SPACING = 7;
     var ROW_GAP = 3;
-    var SCROLLBAR_WIDTH = 16;
-    var SCROLLBAR_GAP = 4;
-    var SCROLL_STEP = 24;
     var DRAG_THRESHOLD = 4;
+
+    // Set to true to show the last mouse events in the status line.
+    // Useful when the mouse misbehaves in a particular AE version.
+    var DEBUG_EVENTS = false;
+
+    // The scrollbar is drawn by the list itself: the native ScriptUI
+    // scrollbar in After Effects moves its thumb in coarse steps.
+    var SCROLLBAR_WIDTH = 14;   // hit strip at the right edge of the list
+    var SCROLLBAR_GAP = 4;      // space between the cards and that strip
+    var THUMB_WIDTH = 6;
+    var THUMB_MIN_HEIGHT = 24;
+    var PAGE_OVERLAP = 24;      // a track click pages by the view height minus this
     var CARD_BASE_HEIGHT = 48;
     var DESCRIPTION_LINE_HEIGHT = 14;
     var MAX_DESCRIPTION_LINES = 3;
@@ -38,7 +47,9 @@
         text: [0.96, 0.96, 0.96, 1],
         textMissing: [0.55, 0.55, 0.55, 1],
         description: [0.68, 0.68, 0.68, 1],
-        heading: [0.62, 0.62, 0.62, 1]
+        heading: [0.62, 0.62, 0.62, 1],
+        thumb: [0.40, 0.40, 0.40, 1],
+        thumbActive: [0.62, 0.62, 0.62, 1]
     };
 
     var scriptsFolder = null;
@@ -52,15 +63,15 @@
     var contentHeight = 0;
     var scrollOffset = 0;
     var maxScroll = 0;
-    var syncingScrollBar = false;
     var measuredListWidth = -1;
     var drawingStyles = null;
-    var lastThumbOffset = -1;
 
-    // Mouse state for hover, click and drag-to-scroll.
+    // Mouse state for hover, click, drag-to-scroll and the scrollbar.
     var hoverIndex = -1;
     var pressIndex = -1;
-    var drag = null;
+    var drag = null;          // press on a card: click or grab the list
+    var barPress = null;      // press on the scrollbar strip
+    var barHover = false;
 
     function readSavedFolder() {
         try {
@@ -372,24 +383,23 @@
     searchBox.helpTip = "Filter scripts by name or folder";
 
     // Scrollable list.
-    // ScriptUI has no scrolling container, and moving a group full of
-    // controls makes After Effects repaint every one of them on each scroll
-    // step. Instead the whole list is a single custom-drawn control that
-    // paints only the rows currently in view, so a scroll step is one cheap
-    // repaint. listArea gets its place from the layout manager; the list and
-    // the scrollbar inside it are placed by hand (see fitLayout). Its explicit
-    // preferredSize keeps it from asking for the height of all rows.
+    // ScriptUI has no scrolling container, so the whole list, scrollbar
+    // included, is a single custom-drawn control that paints only the rows
+    // currently in view. listArea gets its place from the layout manager and
+    // the list fills it (see fitLayout); the explicit preferredSize keeps it
+    // from asking for the height of all rows.
     var listArea = win.add("group");
     listArea.alignment = ["fill", "fill"];
     listArea.margins = 0;
     listArea.preferredSize = [300, 320];
     listArea.minimumSize = [120, 40];
 
-    var list = listArea.add("customButton", [0, 0, 100, 100]);
-
-    // Created with tall bounds so the native control is vertical from the start.
-    var scrollBar = listArea.add("scrollbar", [0, 0, SCROLLBAR_WIDTH, 100], 0, 0, 100);
-    scrollBar.visible = false;
+    // customView, not customButton: in After Effects a customButton gets no
+    // mousemove while the button is held and never gets mouseup (only
+    // mousedown and onClick), so nothing can be dragged on it. A customView
+    // gets mousedown, mousemove while held (even slightly past its edges)
+    // and mouseup. Measured with MouseEventTest.jsx.
+    var list = listArea.add("customView", [0, 0, 100, 100]);
 
     var statusLabel = win.add("statictext", undefined, "");
     statusLabel.alignment = ["fill", "bottom"];
@@ -419,6 +429,7 @@
         hoverIndex = -1;
         pressIndex = -1;
         drag = null;
+        barPress = null;
     }
 
     function addRow(row) {
@@ -588,22 +599,41 @@
             textPen: g.newPen(line, COLORS.text, 1),
             missingPen: g.newPen(line, COLORS.textMissing, 1),
             descriptionPen: g.newPen(line, COLORS.description, 1),
-            headingPen: g.newPen(line, COLORS.heading, 1)
+            headingPen: g.newPen(line, COLORS.heading, 1),
+            thumbBrush: g.newBrush(solid, COLORS.thumb),
+            thumbActiveBrush: g.newBrush(solid, COLORS.thumbActive)
         };
         return drawingStyles;
+    }
+
+    // Rounded bar from a rectangle and two circles, each filled separately
+    // so overlapping sub-paths can't punch holes.
+    function fillPill(g, brush, x, y, w, h) {
+        if (h < w) h = w;
+        g.newPath();
+        g.rectPath(x, y + w / 2, w, h - w);
+        g.fillPath(brush);
+        g.newPath();
+        g.ellipsePath(x, y, w, w);
+        g.fillPath(brush);
+        g.newPath();
+        g.ellipsePath(x, y + h - w, w, w);
+        g.fillPath(brush);
     }
 
     list.onDraw = function () {
         if (!this.size) return;
         var g = this.graphics;
-        var width = this.size[0];
+        var fullWidth = this.size[0];
         var height = this.size[1];
-        if (width <= 0 || height <= 0) return;
+        if (fullWidth <= 0 || height <= 0) return;
 
         var styles = getDrawingStyles(g);
+        // Cards stop short of the scrollbar strip; the well spans everything.
+        var width = cardsWidth(fullWidth);
 
         g.newPath();
-        g.rectPath(0, 0, width, height);
+        g.rectPath(0, 0, fullWidth, height);
         g.fillPath(styles.wellBrush);
 
         for (var i = firstVisibleRow(scrollOffset); i < rows.length; i++) {
@@ -636,6 +666,14 @@
                 g.drawString(row.fitTitle, titlePen, 10, top + 6, fonts.row);
             }
         }
+
+        if (maxScroll > 0) {
+            var thumb = thumbGeometry(height);
+            var active = barHover || (barPress && barPress.onThumb);
+            fillPill(g, active ? styles.thumbActiveBrush : styles.thumbBrush,
+                fullWidth - SCROLLBAR_WIDTH + (SCROLLBAR_WIDTH - THUMB_WIDTH) / 2,
+                thumb.top + 1, THUMB_WIDTH, thumb.height - 2);
+        }
     };
 
     function redrawList() {
@@ -648,40 +686,73 @@
         return Math.max(0, Math.min(Math.round(value), maxScroll));
     }
 
-    function syncScrollBar(force) {
-        // Updating a native scrollbar for every mouse pixel is expensive in
-        // ScriptUI. Keep its thumb reasonably close during drag and catch up
-        // exactly when the gesture ends.
-        if (!force && Math.abs(scrollOffset - lastThumbOffset) < 12) return;
-        syncingScrollBar = true;
-        try {
-            scrollBar.value = scrollOffset;
-            lastThumbOffset = scrollOffset;
-        } finally {
-            syncingScrollBar = false;
-        }
-    }
-
-    function setScroll(value, draggingList) {
+    function setScroll(value) {
         var next = clampScroll(value);
         if (next === scrollOffset) return;
         scrollOffset = next;
-        syncScrollBar(!draggingList);
         redrawList();
     }
 
-    function onScrollBar() {
-        if (syncingScrollBar) return;
-        var next = clampScroll(scrollBar.value);
-        if (next === scrollOffset) return;
-        scrollOffset = next;
-        lastThumbOffset = next;
-        redrawList();
+    // Width left for the cards; the scrollbar strip exists only on overflow.
+    function cardsWidth(fullWidth) {
+        return maxScroll > 0
+            ? Math.max(1, fullWidth - SCROLLBAR_WIDTH - SCROLLBAR_GAP) : fullWidth;
     }
-    scrollBar.onChanging = onScrollBar;
-    scrollBar.onChange = onScrollBar;
 
-    // ---- Mouse: hover, click, drag-to-scroll ---------------------------------
+    function isOnScrollbar(x) {
+        return maxScroll > 0 && !!list.size && x >= cardsWidth(list.size[0]);
+    }
+
+    // Thumb size is proportional to how much of the list is visible.
+    function thumbGeometry(height) {
+        var thumbHeight = Math.round(height * height / Math.max(contentHeight, 1));
+        thumbHeight = Math.min(height, Math.max(THUMB_MIN_HEIGHT, thumbHeight));
+        var travel = height - thumbHeight;
+        return {
+            top: (maxScroll > 0 && travel > 0) ? Math.round(travel * scrollOffset / maxScroll) : 0,
+            height: thumbHeight,
+            travel: travel
+        };
+    }
+
+    function offsetForThumbTop(thumbTop, geometry) {
+        if (geometry.travel <= 0) return 0;
+        return thumbTop / geometry.travel * maxScroll;
+    }
+
+    // A click on the track pages toward the click, like a native scrollbar.
+    function pageToward(y) {
+        var height = list.size[1];
+        var thumb = thumbGeometry(height);
+        var page = Math.max(ROW_GAP, height - PAGE_OVERLAP);
+        if (y < thumb.top) setScroll(scrollOffset - page);
+        else if (y >= thumb.top + thumb.height) setScroll(scrollOffset + page);
+    }
+
+    // ---- Mouse: hover, click, drag-to-scroll, scrollbar ---------------------
+    //
+    // The list is a customView, which in After Effects reports mousedown,
+    // mousemove while the button is held (also slightly past its edges) and
+    // mouseup. A gesture starts on mousedown and ends on mouseup or on the
+    // next mousedown; mouseout only clears hover. Actions happen on release.
+
+    var eventLog = [];
+
+    function logEvent(name, e) {
+        if (!DEBUG_EVENTS) return;
+        var entry = name;
+        if (e && typeof e.clientY === "number") {
+            entry += " " + Math.round(e.clientX) + "," + Math.round(e.clientY);
+        }
+        // Collapse runs of moves so the line stays readable.
+        if (name === "move" && eventLog.length && eventLog[eventLog.length - 1].indexOf("move") === 0) {
+            eventLog[eventLog.length - 1] = entry;
+        } else {
+            eventLog.push(entry);
+        }
+        if (eventLog.length > 6) eventLog.shift();
+        statusLabel.text = eventLog.join(" · ");
+    }
 
     var tipIndex = -1;
 
@@ -700,53 +771,107 @@
         redrawList();
     }
 
+    function setBarHover(on) {
+        if (on === barHover) return false;
+        barHover = on;
+        return true;
+    }
+
     list.addEventListener("mousedown", function (e) {
+        logEvent("down", e);
+        drag = null;
+        barPress = null;
+        pressIndex = -1;
+
+        if (isOnScrollbar(e.clientX)) {
+            var thumb = thumbGeometry(list.size[1]);
+            barPress = {
+                onThumb: e.clientY >= thumb.top && e.clientY < thumb.top + thumb.height,
+                grab: e.clientY - thumb.top,
+                y: e.clientY
+            };
+            return;
+        }
+
         pressIndex = rowIndexAt(e.clientY + scrollOffset);
         drag = { y: e.clientY, offset: scrollOffset, moved: false };
     });
 
     list.addEventListener("mousemove", function (e) {
+        if (barPress || drag) logEvent("move", e);
+        if (barPress) {
+            // The thumb follows the cursor pixel for pixel. A press on the
+            // track waits for release and pages then.
+            if (barPress.onThumb) {
+                var before = scrollOffset;
+                setScroll(offsetForThumbTop(e.clientY - barPress.grab, thumbGeometry(list.size[1])));
+                if (scrollOffset === before && !barPress.shown) redrawList();
+                barPress.shown = true;
+            }
+            return;
+        }
         if (drag) {
             // Grab the list and drag it, like the Hand tool.
             var dy = e.clientY - drag.y;
             if (!drag.moved && Math.abs(dy) >= DRAG_THRESHOLD) drag.moved = true;
             if (drag.moved) {
                 if (hoverIndex !== -1) setHover(-1);
-                setScroll(drag.offset - dy, true);
+                setScroll(drag.offset - dy);
             }
             return;
         }
-        setHover(rowIndexAt(e.clientY + scrollOffset));
+
+        var onBar = isOnScrollbar(e.clientX);
+        var barChanged = setBarHover(onBar);
+        var hoverBefore = hoverIndex;
+        setHover(onBar ? -1 : rowIndexAt(e.clientY + scrollOffset));
+        if (barChanged && hoverIndex === hoverBefore) redrawList();
     });
 
-    // A customButton's onClick is not consistently delivered by every AE
-    // ScriptUI host, so activate from the mouseup event itself. onClick is
-    // retained only as a fallback; pressIndex prevents double execution.
+    // Runs on mouseup: pages for a track click, runs the script for a click
+    // that started and ended on the same card without dragging.
     function finishPress(clientY) {
+        if (barPress) {
+            var press = barPress;
+            barPress = null;
+            if (!press.onThumb) pageToward(press.y);
+            redrawList();
+            return;
+        }
+
         var index = pressIndex;
         var wasDrag = !!(drag && drag.moved);
         pressIndex = -1;
         drag = null;
-        syncScrollBar(true);
         if (wasDrag || !isClickable(index)) return;
         if (typeof clientY === "number" && rowIndexAt(clientY + scrollOffset) !== index) return;
         runScript(rows[index].item.file);
     }
 
     list.addEventListener("mouseup", function (e) {
+        logEvent("up", e);
         finishPress(e.clientY);
+
+        // Released outside the list: drop the hover that mouseout skipped.
+        var size = list.size;
+        if (size && (e.clientX < 0 || e.clientY < 0 || e.clientX >= size[0] || e.clientY >= size[1])) {
+            var barChanged = setBarHover(false);
+            var hoverBefore = hoverIndex;
+            setHover(-1);
+            if (barChanged && hoverIndex === hoverBefore) redrawList();
+        }
     });
 
-    list.addEventListener("mouseout", function () {
-        if (drag && drag.moved) syncScrollBar(true);
-        drag = null;
-        pressIndex = -1;
+    list.addEventListener("mouseout", function (e) {
+        logEvent("out", e);
+        // Hover only. A drag keeps going: moves and the final mouseup still
+        // arrive when the cursor slips past the edge.
+        if (barPress || drag) return;
+        var barChanged = setBarHover(false);
+        var hoverBefore = hoverIndex;
         setHover(-1);
+        if (barChanged && hoverIndex === hoverBefore) redrawList();
     });
-
-    list.onClick = function () {
-        if (pressIndex >= 0) finishPress();
-    };
 
     // ---- Layout ---------------------------------------------------------------
 
@@ -767,26 +892,13 @@
         maxScroll = Math.max(0, contentHeight - areaHeight);
         scrollOffset = clampScroll(scrollOffset);
 
+        // The list control spans the whole area; the scrollbar strip is part
+        // of its drawing (see cardsWidth).
+        var fullWidth = Math.max(1, areaWidth);
+        var fullHeight = Math.max(1, areaHeight);
         list.location = [0, 0];
-        list.size = [listWidth, Math.max(1, areaHeight)];
-
-        // Programmatic changes must not feed back into onScrollBar.
-        syncingScrollBar = true;
-        try {
-            scrollBar.visible = needsBar;
-            if (needsBar) {
-                scrollBar.location = [areaWidth - SCROLLBAR_WIDTH, 0];
-                scrollBar.size = [SCROLLBAR_WIDTH, areaHeight];
-                scrollBar.value = 0;
-                scrollBar.minvalue = 0;
-                scrollBar.maxvalue = maxScroll;
-                scrollBar.value = scrollOffset;
-                scrollBar.stepdelta = SCROLL_STEP;
-                scrollBar.jumpdelta = Math.max(SCROLL_STEP, areaHeight - SCROLL_STEP);
-            }
-            lastThumbOffset = scrollOffset;
-        } finally {
-            syncingScrollBar = false;
+        if (!list.size || list.size[0] !== fullWidth || list.size[1] !== fullHeight) {
+            list.size = [fullWidth, fullHeight];
         }
         redrawList();
     }
