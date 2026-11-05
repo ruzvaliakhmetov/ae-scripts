@@ -1,0 +1,22 @@
+[
+  {
+    "Headline": "Replace footage",
+    "Description": "Replace the selected layer's source",
+    "JSX": "ReplaceAndFit.jsx"
+  },
+  {
+    "Headline": "Relink Identical Footage",
+    "Description": "Relinks identical footage from folders with the same name as the selected folder. Does not detect duplicates within a folder or delete files.",
+    "JSX": "RelinkIdenticalFootage.jsx"
+  },
+  {
+    "Headline": "Scale Down Entire AE Project",
+    "Description": "Scales all compositions and precompositions in the project to 50% while keeping their layout consistent.",
+    "JSX": "ScaleDownEntireAEProject.jsx"
+  },
+  {
+    "Headline": "Crop the Comp",
+    "Description": "Changes the size of the active composition with an anchor selector, similar to Photoshop Canvas Size.",
+    "JSX": "CompSizeAnchor.jsx"
+  }
+]
