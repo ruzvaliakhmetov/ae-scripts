@@ -49,8 +49,12 @@
         description: [0.68, 0.68, 0.68, 1],
         heading: [0.62, 0.62, 0.62, 1],
         thumb: [0.40, 0.40, 0.40, 1],
-        thumbActive: [0.62, 0.62, 0.62, 1]
+        thumbActive: [0.62, 0.62, 0.62, 1],
+        buttonPressed: [0.15, 0.15, 0.15, 1]
     };
+
+    var BUTTON_HEIGHT = 26;
+    var BUTTON_MIN_WIDTH = 72;
 
     var scriptsFolder = null;
     var scripts = [];
@@ -368,13 +372,118 @@
     win.margins = PANEL_MARGIN;
     win.minimumSize = [230, 125];
 
+    var fonts = (function () {
+        try {
+            var family = ScriptUI.applicationFonts.dialog.name;
+            return {
+                title: ScriptUI.newFont(family, ScriptUI.FontStyle.BOLD, 12),
+                description: ScriptUI.newFont(family, ScriptUI.FontStyle.REGULAR, 10),
+                chevron: ScriptUI.newFont(family, ScriptUI.FontStyle.REGULAR, 22),
+                row: ScriptUI.newFont(family, ScriptUI.FontStyle.REGULAR, 12),
+                heading: ScriptUI.newFont(family, ScriptUI.FontStyle.REGULAR, 11),
+                button: ScriptUI.newFont(family, ScriptUI.FontStyle.REGULAR, 12)
+            };
+        } catch (e) {
+            var font = win.graphics.font;
+            return {
+                title: font, description: font, chevron: font,
+                row: font, heading: font, button: font
+            };
+        }
+    })();
+
+    // Toolbar buttons are drawn like the cards. Native buttons get the macOS
+    // focus ring, which the panel clips into a stray blue bracket. Built on
+    // customView for the same reason as the list: it reports mouseup.
+    function addFlatButton(parent, label, onPress) {
+        var button = parent.add("customView", [0, 0, 80, BUTTON_HEIGHT]);
+        var hover = false;
+        var pressed = false;
+
+        var width = 80;
+        try {
+            width = Math.max(BUTTON_MIN_WIDTH,
+                Math.ceil(button.graphics.measureString(label, fonts.button).width) + 28);
+        } catch (e) {}
+        button.preferredSize = [width, BUTTON_HEIGHT];
+        button.size = [width, BUTTON_HEIGHT];
+
+        function repaint() {
+            try { button.notify("onDraw"); } catch (e) {}
+        }
+
+        function isInside(e) {
+            var size = button.size;
+            return !!size && e.clientX >= 0 && e.clientY >= 0 &&
+                e.clientX < size[0] && e.clientY < size[1];
+        }
+
+        button.onDraw = function () {
+            if (!this.size) return;
+            var g = this.graphics;
+            var w = this.size[0];
+            var h = this.size[1];
+            var fill = (pressed && hover) ? COLORS.buttonPressed
+                : hover ? COLORS.rowHover : COLORS.row;
+
+            g.newPath();
+            g.rectPath(0, 0, w - 1, h - 1);
+            g.fillPath(g.newBrush(g.BrushType.SOLID_COLOR, fill));
+            g.strokePath(g.newPen(g.PenType.SOLID_COLOR, COLORS.border, 1));
+
+            var pen = g.newPen(g.PenType.SOLID_COLOR, COLORS.text, 1);
+            try {
+                var text = g.measureString(label, fonts.button);
+                g.drawString(label, pen, Math.round((w - text.width) / 2),
+                    Math.round((h - text.height) / 2), fonts.button);
+            } catch (e) {
+                g.drawString(label, pen, 12, 5, fonts.button);
+            }
+        };
+
+        button.addEventListener("mouseover", function () {
+            hover = true;
+            repaint();
+        });
+        button.addEventListener("mouseout", function () {
+            hover = false;
+            repaint();
+        });
+        button.addEventListener("mousemove", function (e) {
+            // While held, moves keep coming past the edges: track in/out
+            // so dragging off the button un-presses it, as with native ones.
+            var inside = isInside(e);
+            if (inside === hover) return;
+            hover = inside;
+            repaint();
+        });
+        button.addEventListener("mousedown", function () {
+            pressed = true;
+            hover = true;
+            repaint(); // instant feedback before any slow dialog opens
+        });
+        button.addEventListener("mouseup", function (e) {
+            var activate = pressed && isInside(e);
+            pressed = false;
+            hover = isInside(e);
+            repaint();
+            if (!activate) return;
+            onPress();
+            // A modal dialog may have taken the cursor elsewhere.
+            hover = false;
+            repaint();
+        });
+
+        return button;
+    }
+
     var toolbar = win.add("group");
     toolbar.orientation = "row";
     toolbar.alignment = ["fill", "top"];
     toolbar.spacing = 6;
 
-    var chooseButton = toolbar.add("button", undefined, "Folder...");
-    var refreshButton = toolbar.add("button", undefined, "Refresh");
+    addFlatButton(toolbar, "Folder…", function () { chooseFolder(); });
+    addFlatButton(toolbar, "Refresh", function () { refreshScripts(); });
     var folderLabel = win.add("statictext", undefined, "No folder selected", { truncate: "middle" });
     folderLabel.alignment = ["fill", "top"];
 
@@ -403,22 +512,6 @@
 
     var statusLabel = win.add("statictext", undefined, "");
     statusLabel.alignment = ["fill", "bottom"];
-
-    var fonts = (function () {
-        try {
-            var family = ScriptUI.applicationFonts.dialog.name;
-            return {
-                title: ScriptUI.newFont(family, ScriptUI.FontStyle.BOLD, 12),
-                description: ScriptUI.newFont(family, ScriptUI.FontStyle.REGULAR, 10),
-                chevron: ScriptUI.newFont(family, ScriptUI.FontStyle.REGULAR, 22),
-                row: ScriptUI.newFont(family, ScriptUI.FontStyle.REGULAR, 12),
-                heading: ScriptUI.newFont(family, ScriptUI.FontStyle.REGULAR, 11)
-            };
-        } catch (e) {
-            var font = list.graphics.font;
-            return { title: font, description: font, chevron: font, row: font, heading: font };
-        }
-    })();
 
     // ---- Row model ----------------------------------------------------------
 
@@ -933,7 +1026,7 @@
         if (!scriptsFolder || !scriptsFolder.exists) {
             folderLabel.text = "Choose a folder containing your scripts";
             folderLabel.helpTip = "";
-            addTextRow("Click Folder... to begin.");
+            addTextRow("Click Folder… to begin.");
             statusLabel.text = "";
         } else {
             folderLabel.text = readableName(scriptsFolder.name);
@@ -971,16 +1064,15 @@
         updateScroll();
     }
 
-    chooseButton.onClick = function () {
+    function chooseFolder() {
         var folder = Folder.selectDialog("Choose the folder containing your After Effects scripts");
         if (folder) {
             scriptsFolder = folder;
             saveFolder(folder);
             refreshScripts();
         }
-    };
+    }
 
-    refreshButton.onClick = refreshScripts;
     searchBox.onChanging = renderScripts;
     win.onResizing = win.onResize = function () {
         this.layout.resize();
